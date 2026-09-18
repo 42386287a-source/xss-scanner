@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# إعدادات حساسة
+config.json
+logs/
+*.log
+
+# تقارير
+report.html
+test_report.html
+my_report.html
+
+# نظام التشغيل
+.DS_Store
+Thumbs.db
