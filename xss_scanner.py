@@ -18,7 +18,7 @@ from modules.reporter import generate_report
 
 
 # ==================== إعدادات ثابتة ====================
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 TOOL_NAME = "XSStrike-Lite"
 DEFAULT_LOG_DIR = "logs"
 DEFAULT_PAYLOAD_FILE = "payloads/xss_payloads.txt"
@@ -87,13 +87,25 @@ def build_parser():
     
     subparsers = parser.add_subparsers(dest='command', help='الأوامر الفرعية')
     
+    # ----- أمر scan -----
     scan_parser = subparsers.add_parser('scan', help='فحص موقع كامل')
     scan_parser.add_argument('--url', required=True, help='رابط الموقع')
     scan_parser.add_argument('--payload-file', default=DEFAULT_PAYLOAD_FILE,
                              help='ملف الحمولات')
     scan_parser.add_argument('--output', default='report.html',
                              help='ملف التقرير')
+    scan_parser.add_argument('--login-url', default=None,
+                             help='رابط تسجيل الدخول (لتسجيل الدخول تلقائياً)')
+    scan_parser.add_argument('--username', default=None,
+                             help='اسم المستخدم')
+    scan_parser.add_argument('--password', default=None,
+                             help='كلمة المرور')
+    scan_parser.add_argument('--type', choices=['reflected', 'stored', 'dom'],
+                             default='reflected', help='نوع XSS')
+    scan_parser.add_argument('--detect-waf', action='store_true',
+                             help='كشف WAF')
     
+    # ----- أمر check -----
     check_parser = subparsers.add_parser('check', help='فحص مدخل واحد')
     check_parser.add_argument('--url', required=True, help='رابط الصفحة')
     check_parser.add_argument('--param', required=True, help='اسم المعامل')
@@ -131,52 +143,195 @@ def handle_error(error, logger):
 def run_scan(args, logger):
     """تنفيذ أمر الفحص الكامل."""
     logger.info(f"🔍 بدء الفحص على: {args.url}")
+    logger.info(f"📄 ملف الحمولات: {args.payload_file}")
+    logger.info(f"📊 ملف التقرير: {args.output}")
+    logger.info(f"🔧 النوع: {args.type}")
     
     if not os.path.exists(args.payload_file):
         raise FileNotFoundError(f"ملف الحمولات غير موجود: {args.payload_file}")
     
-    from modules.crawler import fetch_page, extract_forms
+    from modules.crawler import fetch_page, extract_forms, login
     from modules.injector import inject_payloads, load_payloads
     from modules.detector import scan_results
     
-    cookies = {'PHPSESSID': 'ضع_قيمتك_هنا', 'security': 'low'}
+    # إعدادات افتراضية
+    cookies = {}
     delay = 0.2
     timeout = 10
     
-    if hasattr(args, 'config') and args.config:
-        logger.info(f"⚙️  تحميل الإعدادات من: {args.config}")
+    # تسجيل الدخول التلقائي
+    if hasattr(args, 'login_url') and args.login_url:
+        logger.info(f"🔐 تسجيل الدخول تلقائياً إلى: {args.login_url}")
+        cookies = login(
+            login_url=args.login_url,
+            username=args.username,
+            password=args.password,
+            timeout=timeout,
+            check_url=args.url
+        )
+        logger.info(f"✅ تم تسجيل الدخول. الكوكيز: {list(cookies.keys())}")
+    elif hasattr(args, 'config') and args.config:
         config = load_config(args.config)
-        if 'cookies' in config: cookies = config['cookies']
-        if 'delay' in config: delay = config['delay']
-        if 'timeout' in config: timeout = config['timeout']
+        if 'cookies' in config:
+            cookies = config['cookies']
+        if 'delay' in config:
+            delay = config['delay']
+        if 'timeout' in config:
+            timeout = config['timeout']
     
+    # كشف WAF إذا طُلب
+    if hasattr(args, 'detect_waf') and args.detect_waf:
+        logger.info("🛡️ كشف WAF...")
+        from modules.waf_detector import detect_waf
+    
+        waf_result = detect_waf(args.url, timeout=timeout, cookies=cookies)
+    
+        if waf_result['detected']:
+            logger.warning(f"🚨 WAF مكتشف: {waf_result['name']}")
+            for evidence in waf_result['evidence']:
+                logger.warning(f"  - {evidence}")
+        else:
+            logger.info("✅ لا يوجد WAF")
+        print()
+
+
+    # المرحلة 1: جلب الصفحة
     logger.info("🌐 [1/4] جلب الصفحة...")
     html = fetch_page(args.url, timeout=timeout, cookies=cookies)
     logger.info(f"✅ تم جلب الصفحة ({len(html)} حرف)")
     
+    # المرحلة 2: استخراج النماذج
     logger.info("📋 [2/4] استخراج النماذج...")
     forms = extract_forms(html)
     logger.info(f"✅ تم اكتشاف {len(forms)} نموذجاً")
     
-    if not forms:
+    if not forms and args.type != 'dom':
         logger.warning("⚠️ لم يتم اكتشاف أي نماذج")
         return
     
+    # المرحلة 3: تحميل الحمولات
     logger.info(f"📦 [3/4] تحميل الحمولات...")
     payloads = load_payloads(args.payload_file)
     logger.info(f"✅ تم تحميل {len(payloads)} حمولة")
     
-    logger.info("💉 [4/4] بدء الحقن والفحص...")
+    # المرحلة 4: حسب النوع
     all_results = []
     
-    for i, form in enumerate(forms, 1):
-        for inp in form['inputs']:
-            logger.info(f"    💉 حقن في: {inp['name']}")
-            results = inject_payloads(args.url, inp['name'], payloads,
-                                     form['method'], cookies, delay)
-            vulns = scan_results(results)
-            all_results.extend(vulns)
+    if args.type == 'dom':
+        # ========== DOM-based XSS ==========
+        logger.info("💉 [4/4] تحليل DOM-based XSS...")
+        from modules.dom_analyzer import analyze_dom
+        
+        dom_result = analyze_dom(html)
+        
+        if dom_result['vulnerable']:
+            logger.warning(f"🚨 تم اكتشاف {len(dom_result['sinks'])} DOM Sink!")
+            for sink in dom_result['sinks']:
+                logger.warning(f"  - {sink['type']}: {sink['code'][:50]}")
+                all_results.append({
+                    'payload': sink['code'][:100],
+                    'status': 'N/A',
+                    'response': sink['context'],
+                    'analysis': {
+                        'vulnerable': True,
+                        'severity': 'عالية',
+                        'message': f"DOM Sink: {sink['type']}",
+                        'reflection': {'context': sink['type']}
+                    }
+                })
+        else:
+            logger.info("✅ لا توجد ثغرات DOM محتملة")
     
+    elif args.type == 'stored':
+    # ========== Stored XSS ==========
+        logger.info("💉 [4/4] فحص Stored XSS...")
+    
+    # اختبار كل مدخل
+        for i, form in enumerate(forms, 1):
+            logger.info(f"  📝 النموذج {i}: {len(form['inputs'])} مدخل")
+        
+        # أرسل حمولة اختبارية
+            test_payload = "<script>alert('StoredXSS_TEST')</script>"
+        
+        # تجهيز بيانات النموذج (كل الحقول معاً)
+            form_data = {}
+            for inp in form['inputs']:
+                if inp['name'] == 'btnSign':
+                # زر الإرسال
+                    continue
+                form_data[inp['name']] = test_payload
+            form_data['btnSign'] = 'Sign Guestbook'
+        
+        # إرسال النموذج (POST)
+            logger.info(f"    💉 إرسال حمولة اختبارية...")
+        
+            from modules.injector import send_request
+        
+            try:
+                status, response = send_request(
+                    url=args.url,
+                    method='POST',
+                    params=form_data,
+                    cookies=cookies
+                )
+                logger.info(f"    ✅ تم الإرسال. الحالة: {status}")
+            except Exception as e:
+                logger.error(f"    ❌ فشل الإرسال: {e}")
+                continue
+        
+        # إعادة تحميل الصفحة (GET) للتحقق
+            logger.info(f"    🔄 إعادة تحميل الصفحة للتحقق...")
+            import time
+            time.sleep(1)  # انتظر ثانية
+        
+            try:
+                reloaded_html = fetch_page(args.url, timeout=timeout, cookies=cookies)
+            
+            # تحقق إذا كانت الحمولة موجودة
+                if test_payload in reloaded_html or 'StoredXSS_TEST' in reloaded_html:
+                    logger.warning(f"    🚨 ثغرة Stored XSS مؤكدة!")
+                
+                # إضافة النتائج لكل الحمولات
+                    for payload in payloads:
+                        all_results.append({
+                            'payload': payload,
+                            'status': 200,
+                            'response': reloaded_html[:500],
+                            'analysis': {
+                                'vulnerable': True,
+                                'severity': 'حرجة',
+                                'message': 'Stored XSS مؤكدة (الحمولة تُخزّن في قاعدة البيانات)',
+                                'reflection': {'context': 'Stored (مخزنة)'}
+                            }
+                        })
+                else:
+                    logger.info(f"    ✅ لا توجد ثغرة Stored")
+            except Exception as e:
+                logger.error(f"    ❌ فشل التحقق: {e}")
+    
+    else:
+        # ========== Reflected XSS (الافتراضي) ==========
+        logger.info("💉 [4/4] فحص Reflected XSS...")
+        
+        for i, form in enumerate(forms, 1):
+            logger.info(f"  📝 النموذج {i}: {len(form['inputs'])} مدخل")
+            
+            for inp in form['inputs']:
+                logger.info(f"    💉 حقن في: {inp['name']}")
+                
+                results = inject_payloads(
+                    url=args.url,
+                    param_name=inp['name'],
+                    payloads=payloads,
+                    method=form['method'],
+                    cookies=cookies,
+                    delay=delay
+                )
+                
+                vulns = scan_results(results)
+                all_results.extend(vulns)
+    
+    # الملخص
     print()
     print("=" * 60)
     print("📊 ملخص الفحص:")
@@ -186,29 +341,34 @@ def run_scan(args, logger):
     else:
         logger.info("✅ لم يتم اكتشاف أي ثغرات")
     
+    # إنشاء التقرير
     report_path = generate_report(
-        target_url=args.url, vulnerabilities=all_results,
-        output_file=args.output, forms_count=len(forms),
-        payloads_count=len(payloads)
+        target_url=args.url,
+        vulnerabilities=all_results,
+        output_file=args.output,
+        forms_count=len(forms),
+        payloads_count=len(payloads),
+        version=VERSION
     )
     
     report_abs_path = Path(report_path).resolve()
     logger.info(f"✅ التقرير: {report_abs_path}")
     logger.info(f"🌐 افتحه: {report_abs_path.as_uri()}")
 
-
 def run_check(args, logger):
     """تنفيذ أمر الفحص الفردي."""
     from modules.injector import inject_payloads, load_payloads
     from modules.detector import scan_results
     
-    cookies = {'PHPSESSID': 'ضع_قيمتك_هنا', 'security': 'low'}
+    cookies = {}
     delay = 0.2
     
     if hasattr(args, 'config') and args.config:
         config = load_config(args.config)
-        if 'cookies' in config: cookies = config['cookies']
-        if 'delay' in config: delay = config['delay']
+        if 'cookies' in config:
+            cookies = config['cookies']
+        if 'delay' in config:
+            delay = config['delay']
     
     payloads = load_payloads(DEFAULT_PAYLOAD_FILE)
     results = inject_payloads(args.url, args.param, payloads,

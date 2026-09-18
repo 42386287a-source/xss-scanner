@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-خادم وهمي للمهاجم
-يستقبل الكوكي المسروق من الضحية.
+خادم المهاجم الوهمي
+يستقبل الكوكيز المسروقة من الضحايا.
 """
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
